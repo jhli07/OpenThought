@@ -82,7 +82,53 @@ export KIMI_API_KEY=xxx
 
 # Claude
 export ANTHROPIC_API_KEY=sk-ant-xxx
+
+# DeepSeek
+export DEEPSEEK_API_KEY=xxx
+
+# Qwen
+export QWEN_API_KEY=xxx
+
+# Zhipu
+export ZHIPU_API_KEY=xxx
 ```
+
+### 🏠 本地模型支持
+
+OpenThought 支持连接任何**兼容 OpenAI API 的服务**，包括本地部署的模型：
+
+```python
+from openthought.providers import create_provider
+
+# Ollama (本地)
+provider = create_provider("ollama", model="llama3")
+
+# LM Studio
+provider = create_provider("lmstudio", model="llama-3-8b-instruct")
+
+# vLLM
+provider = create_provider("vllm", model="llama-2-7b")
+```
+
+### 🔧 完全自定义配置
+
+如果你的服务不在预设列表中，可以完全自定义：
+
+```python
+from openthought.providers import create_provider
+
+provider = create_provider(
+    name="custom",
+    api_key="your-api-key",  # 可选
+    base_url="http://your-server:11434/v1",  # 你的服务地址
+    model="your-model-name",
+)
+```
+
+**支持的服务类型：**
+- 🌐 **云服务**: OpenAI、Claude、Kimi、DeepSeek、Qwen、Zhipu、Yi、Minimax
+- 🏠 **本地服务**: Ollama、LM Studio、LocalAI、vLLM
+- 🔧 **自定义**: 任何 OpenAI 兼容的 API 服务
 
 ### 会话管理
 
