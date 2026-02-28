@@ -1,54 +1,130 @@
 """
-OpenThought - AI-Powered Chain-of-Thought Tool for Deep Reflection.
+OpenThought v3.0 - AI-Powered Chain-of-Thought Tool
 
-A sophisticated thinking assistant that uses LLMs to guide users through
-deep, meaningful conversations using the Socratic method.
+A thinking tool that helps you explore ideas through AI-guided Socratic questioning.
 
-Author: Agent_Li
-License: MIT
-Repository: https://github.com/jhli07/OpenThought
-
-Features:
-- 🧠 AI-powered Socratic questioning
-- 🔌 Support for 10+ LLM providers (OpenAI, Kimi, Claude, Ollama, Qwen, etc.)
-- 💾 Session persistence (JSON/SQLite)
-- 🎨 Beautiful CLI and Web interfaces
-- 🎯 Fully customizable via config or API
+New in v3.0:
+- ✨ Streaming responses
+- ⚡ Async/await support
+- 🌿 Savepoints & branching
+- 🎯 Multiple thinking styles
+- 📤 Export to Markdown/HTML
+- 🔧 Improved error handling
 """
 
-from .core import OpenThought, OpenThoughtError, Session
-from .providers import (
-    create_provider,
-    BaseLLMProvider,
-    CustomProvider,
-    list_all_providers,
-    test_provider_connection,
-    CUSTOM_PROVIDER_PRESETS,
-)
-from .config import Config, load_config
-from .storage import JSONStorage, SQLiteStorage, SessionManager
-
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 __author__ = "Agent_Li"
-__license__ = "MIT"
+
+from openthought.core import (
+    OpenThought,
+    OpenThoughtError,
+    ProviderError,
+    ConfigurationError,
+    Session,
+    Message,
+    Savepoint,
+    ThinkingStyle,
+    think,
+)
+
+from openthought.providers import (
+    create_provider,
+    list_providers,
+    test_provider_async,
+    BaseLLMProvider,
+    OpenAIProvider,
+    KimiProvider,
+    ClaudeProvider,
+    AzureProvider,
+    CustomProvider,
+    DeepSeekProvider,
+    QwenProvider,
+    ZhipuProvider,
+)
+
+from openthought.storage import (
+    create_storage,
+    SessionManager,
+    JSONStorage,
+    SQLiteStorage,
+    ExportFormat,
+)
 
 __all__ = [
+    # Version
+    "__version__",
+    
     # Core
     "OpenThought",
     "OpenThoughtError",
+    "ProviderError",
+    "ConfigurationError",
     "Session",
+    "Message",
+    "Savepoint",
+    "ThinkingStyle",
+    "think",
+    
     # Providers
     "create_provider",
+    "list_providers",
+    "test_provider_async",
     "BaseLLMProvider",
+    "OpenAIProvider",
+    "KimiProvider",
+    "ClaudeProvider",
+    "AzureProvider",
     "CustomProvider",
-    "list_all_providers",
-    "test_provider_connection",
-    "CUSTOM_PROVIDER_PRESETS",
-    # Config
-    "Config",
-    "load_config",
+    "DeepSeekProvider",
+    "QwenProvider",
+    "ZhipuProvider",
+    
     # Storage
+    "create_storage",
+    "SessionManager",
     "JSONStorage",
     "SQLiteStorage",
-    "SessionManager",
+    "ExportFormat",
 ]
+
+# Convenience function for quick start
+def chat(
+    prompt: str,
+    api_key: Optional[str] = None,
+    provider: str = "openai",
+    stream: bool = False,
+    **kwargs
+):
+    """
+    Quick chat interface for OpenThought.
+    
+    Args:
+        prompt: The topic to discuss
+        api_key: API key for the LLM
+        provider: LLM provider name
+        stream: Whether to stream response
+        **kwargs: Additional arguments
+    
+    Returns:
+        OpenThought instance
+    """
+    from openthought.providers import create_provider
+    
+    llm_provider = None
+    use_ai = True
+    
+    if api_key:
+        try:
+            llm_provider = create_provider(provider, api_key)
+        except Exception:
+            use_ai = False
+    else:
+        use_ai = False
+    
+    return OpenThought(
+        prompt=prompt,
+        provider=llm_provider,
+        use_ai=use_ai,
+        stream=stream,
+        **kwargs
+    )

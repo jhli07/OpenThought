@@ -1,13 +1,18 @@
 """
-OpenThought LLM Providers - Multi-provider LLM integration.
+OpenThought LLM Providers v3.0 - Multi-provider LLM integration.
 
-Supports OpenAI, Kimi (Moonshot), Anthropic Claude, and custom providers.
+Refactored for:
+- Streaming support
+- Async/await
+- Unified provider abstraction
+- Better error handling
 """
 
-import os
+import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator, Dict, List, Optional, Type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 
 @dataclass
@@ -19,14 +24,35 @@ class ProviderConfig:
     model: str = "gpt-3.5-turbo"
     temperature: float = 0.7
     max_tokens: int = 1000
+    timeout: int = 60
+    max_retries: int = 3
 
 
 class BaseLLMProvider(ABC):
-    """Abstract base class for LLM providers."""
+    """Abstract base class for LLM providers with sync/async/streaming support."""
+    
+    def __init__(self, config: ProviderConfig):
+        self.config = config
+        self._client = None
+    
+    @abstractmethod
+    def _init_client(self):
+        """Initialize the underlying client."""
+        pass
     
     @abstractmethod
     def generate(self, messages: List[Dict[str, str]], **kwargs) -> str:
-        """Generate a response from the LLM."""
+        """Generate a response from the LLM (sync)."""
+        pass
+    
+    @abstractmethod
+    async def agenerate(self, messages: List[Dict[str, str]], **kwargs) -> str:
+        """Generate a response from the LLM (async)."""
+        pass
+    
+    @abstractmethod
+    async def astream_generate(self, messages: List[Dict[str, str]], **kwargs) -> AsyncGenerator[str, None]:
+        """Stream generate responses (async)."""
         pass
     
     @abstractmethod
@@ -41,112 +67,240 @@ class BaseLLMProvider(ABC):
         pass
 
 
-class OpenAIProvider(BaseLLMProvider):
+class OpenAICompatProvider(BaseLLMProvider):
+    """
+    Base provider for OpenAI-compatible APIs.
+    
+    Handles common logic for OpenAI, Kimi, DeepSeek, Qwen, etc.
+    """
+    
+    def __init__(self, config: ProviderConfig):
+        super().__init__(config)
+        self._init_client()
+    
+    def _init_client(self):
+        """Initialize OpenAI client."""
+        try:
+            import openai
+            self._client = openai.OpenAI(
+                api_key=self.config.api_key,
+                base_url=self.config.base_url or "https://api.openai.com/v1",
+                timeout=self.config.timeout,
+            )
+        except ImportError:
+            raise ImportError("Please install openai: pip install openai")
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+    )
+    def generate(self, messages: List[Dict[str, str]], **kwargs) -> str:
+        """Generate response using OpenAI-compatible API."""
+        try:
+            response = self._client.chat.completions.create(
+                model=self.config.model,
+                messages=messages,
+                temperature=kwargs.get("temperature", self.config.temperature),
+                max_tokens=kwargs.get("max_tokens", self.config.max_tokens),
+                stream=False,
+            )
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            self._handle_error(e)
+    
+    async def agenerate(self, messages: List[Dict[str, str]], **kwargs) -> str:
+        """Generate response asynchronously."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, 
+            lambda: self.generate(messages, **kwargs)
+        )
+    
+    async def astream_generate(self, messages: List[Dict[str, str]], **kwargs) -> AsyncGenerator[str, None]:
+        """Stream generate responses."""
+        try:
+            response = self._client.chat.completions.create(
+                model=self.config.model,
+                messages=messages,
+                temperature=kwargs.get("temperature", self.config.temperature),
+                max_tokens=kwargs.get("max_tokens", self.config.max_tokens),
+                stream=True,
+            )
+            
+            for chunk in response:
+                if chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+        except Exception as e:
+            self._handle_error(e)
+    
+    def _handle_error(self, error: Exception) -> None:
+        """Handle and transform errors."""
+        error_str = str(error).lower()
+        
+        if "rate_limit" in error_str or "429" in error_str:
+            raise ProviderError(f"Rate limit exceeded: {error}")
+        elif "timeout" in error_str or "timed_out" in error_str:
+            raise TimeoutError(f"Request timed out: {error}")
+        elif "invalid_api_key" in error_str or "401" in error_str:
+            raise ProviderError(f"Invalid API key: {error}")
+        elif "model_not_found" in error_str or "404" in error_str:
+            raise ProviderError(f"Model not found: {error}")
+        else:
+            raise ProviderError(f"API error: {error}")
+    
+    def get_model_name(self) -> str:
+        return self.config.model
+    
+    @property
+    def provider_name(self) -> str:
+        return self.config.name
+
+
+class OpenAIProvider(OpenAICompatProvider):
     """OpenAI GPT provider."""
     
-    def __init__(self, api_key: str, model: str = "gpt-3.5-turbo", **kwargs):
-        """
-        Initialize OpenAI provider.
-        
-        Args:
-            api_key: OpenAI API key
-            model: Model name (default: gpt-3.5-turbo)
-        """
-        self.api_key = api_key
-        self.model = model
-        self.base_url = kwargs.get("base_url", "https://api.openai.com/v1")
-    
-    def generate(self, messages: List[Dict[str, str]], **kwargs) -> str:
-        """Generate response using OpenAI API."""
-        try:
-            import openai
-            client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
-            
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=kwargs.get("temperature", 0.7),
-                max_tokens=kwargs.get("max_tokens", 1000),
-            )
-            
-            return response.choices[0].message.content or ""
-        except ImportError:
-            raise ImportError("Please install openai: pip install openai")
-        except Exception as e:
-            raise ConnectionError(f"OpenAI API error: {e}")
-    
-    def get_model_name(self) -> str:
-        return self.model
-    
-    @property
-    def provider_name(self) -> str:
-        return "openai"
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-3.5-turbo",
+        **kwargs
+    ):
+        config = ProviderConfig(
+            name="openai",
+            api_key=api_key,
+            model=model,
+            base_url=kwargs.get("base_url", "https://api.openai.com/v1"),
+            temperature=kwargs.get("temperature", 0.7),
+            max_tokens=kwargs.get("max_tokens", 1000),
+            timeout=kwargs.get("timeout", 60),
+        )
+        super().__init__(config)
 
 
-class KimiProvider(BaseLLMProvider):
+class KimiProvider(OpenAICompatProvider):
     """Kimi (Moonshot AI) provider."""
     
-    def __init__(self, api_key: str, model: str = "moonshot-v1-8k", **kwargs):
-        """
-        Initialize Kimi provider.
-        
-        Args:
-            api_key: Kimi API key
-            model: Model name (default: moonshot-v1-8k)
-        """
-        self.api_key = api_key
-        self.model = model
-        self.base_url = kwargs.get("base_url", "https://api.moonshot.cn/v1")
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "moonshot-v1-8k",
+        **kwargs
+    ):
+        config = ProviderConfig(
+            name="kimi",
+            api_key=api_key,
+            model=model,
+            base_url=kwargs.get("base_url", "https://api.moonshot.cn/v1"),
+            temperature=kwargs.get("temperature", 0.7),
+            max_tokens=kwargs.get("max_tokens", 1000),
+        )
+        super().__init__(config)
+
+
+class DeepSeekProvider(OpenAICompatProvider):
+    """DeepSeek provider."""
     
-    def generate(self, messages: List[Dict[str, str]], **kwargs) -> str:
-        """Generate response using Kimi API."""
-        try:
-            import openai
-            client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
-            
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=kwargs.get("temperature", 0.7),
-                max_tokens=kwargs.get("max_tokens", 1000),
-            )
-            
-            return response.choices[0].message.content or ""
-        except ImportError:
-            raise ImportError("Please install openai: pip install openai")
-        except Exception as e:
-            raise ConnectionError(f"Kimi API error: {e}")
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "deepseek-chat",
+        **kwargs
+    ):
+        config = ProviderConfig(
+            name="deepseek",
+            api_key=api_key,
+            model=model,
+            base_url=kwargs.get("base_url", "https://api.deepseek.com/v1"),
+            temperature=kwargs.get("temperature", 0.7),
+            max_tokens=kwargs.get("max_tokens", 1000),
+        )
+        super().__init__(config)
+
+
+class QwenProvider(OpenAICompatProvider):
+    """Qwen (Alibaba) provider."""
     
-    def get_model_name(self) -> str:
-        return self.model
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "qwen-turbo",
+        **kwargs
+    ):
+        config = ProviderConfig(
+            name="qwen",
+            api_key=api_key,
+            model=model,
+            base_url=kwargs.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            temperature=kwargs.get("temperature", 0.7),
+            max_tokens=kwargs.get("max_tokens", 1000),
+        )
+        super().__init__(config)
+
+
+class ZhipuProvider(OpenAICompatProvider):
+    """Zhipu AI (智谱清言) provider."""
     
-    @property
-    def provider_name(self) -> str:
-        return "kimi"
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "glm-4",
+        **kwargs
+    ):
+        config = ProviderConfig(
+            name="zhipu",
+            api_key=api_key,
+            model=model,
+            base_url=kwargs.get("base_url", "https://open.bigmodel.cn/api/paas/v4"),
+            temperature=kwargs.get("temperature", 0.7),
+            max_tokens=kwargs.get("max_tokens", 1000),
+        )
+        super().__init__(config)
 
 
 class ClaudeProvider(BaseLLMProvider):
     """Anthropic Claude provider."""
     
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514", **kwargs):
-        """
-        Initialize Claude provider.
+    def __init__(
+        self,
+        api_key: str,
+        model: Optional[str] = None,  # None = auto-select latest
+        **kwargs
+    ):
+        # Auto-select latest Claude model if not specified
+        default_model = "claude-sonnet-4-20250514"
         
-        Args:
-            api_key: Anthropic API key
-            model: Model name (default: claude-sonnet-4-20250514)
-        """
-        self.api_key = api_key
-        self.model = model
-        self.base_url = kwargs.get("base_url", "https://api.anthropic.com")
+        config = ProviderConfig(
+            name="claude",
+            api_key=api_key,
+            model=model or default_model,
+            base_url=kwargs.get("base_url", "https://api.anthropic.com"),
+            temperature=kwargs.get("temperature", 0.7),
+            max_tokens=kwargs.get("max_tokens", 1000),
+            timeout=kwargs.get("timeout", 60),
+        )
+        super().__init__(config)
+        self._init_client()
     
+    def _init_client(self):
+        """Initialize Anthropic client."""
+        try:
+            import anthropic
+            self._client = anthropic.Anthropic(
+                api_key=self.config.api_key,
+                timeout=self.config.timeout,
+            )
+        except ImportError:
+            raise ImportError("Please install anthropic: pip install anthropic")
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+    )
     def generate(self, messages: List[Dict[str, str]], **kwargs) -> str:
         """Generate response using Claude API."""
         try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=self.api_key)
-            
-            # Convert messages format for Claude
+            # Extract system message
             system_message = None
             for msg in messages:
                 if msg["role"] == "system":
@@ -155,22 +309,66 @@ class ClaudeProvider(BaseLLMProvider):
             
             user_messages = [m for m in messages if m["role"] != "system"]
             
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=kwargs.get("max_tokens", 1000),
-                temperature=kwargs.get("temperature", 0.7),
+            response = self._client.messages.create(
+                model=self.config.model,
+                max_tokens=kwargs.get("max_tokens", self.config.max_tokens),
+                temperature=kwargs.get("temperature", self.config.temperature),
                 system=system_message,
                 messages=user_messages,
             )
             
             return response.content[0].text
-        except ImportError:
-            raise ImportError("Please install anthropic: pip install anthropic")
         except Exception as e:
-            raise ConnectionError(f"Claude API error: {e}")
+            self._handle_error(e)
+    
+    async def agenerate(self, messages: List[Dict[str, str]], **kwargs) -> str:
+        """Generate response asynchronously."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.generate(messages, **kwargs)
+        )
+    
+    async def astream_generate(self, messages: List[Dict[str, str]], **kwargs) -> AsyncGenerator[str, None]:
+        """Stream generate responses."""
+        try:
+            system_message = None
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_message = msg["content"]
+                    break
+            
+            user_messages = [m for m in messages if m["role"] != "system"]
+            
+            with self._client.messages.stream(
+                model=self.config.model,
+                max_tokens=kwargs.get("max_tokens", self.config.max_tokens),
+                temperature=kwargs.get("temperature", self.config.temperature),
+                system=system_message,
+                messages=user_messages,
+            ) as stream:
+                for text in stream.text_stream:
+                    yield text
+        except Exception as e:
+            self._handle_error(e)
+    
+    def _handle_error(self, error: Exception) -> None:
+        """Handle Claude-specific errors."""
+        error_str = str(error).lower()
+        
+        if "rate_limit" in error_str or "429" in error_str:
+            raise ProviderError(f"Claude rate limit exceeded: {error}")
+        elif "authentication" in error_str or "401" in error_str:
+            raise ProviderError(f"Invalid Claude API key: {error}")
+        elif "not_found" in error_str or "404" in error_str:
+            raise ProviderError(f"Claude model not found: {error}")
+        elif "overloaded" in error_str or "529" in error_str:
+            raise ProviderError(f"Claude service overloaded: {error}")
+        else:
+            raise ProviderError(f"Claude API error: {error}")
     
     def get_model_name(self) -> str:
-        return self.model
+        return self.config.model
     
     @property
     def provider_name(self) -> str:
@@ -188,70 +386,81 @@ class AzureProvider(BaseLLMProvider):
         base_url: Optional[str] = None,
         **kwargs
     ):
-        """
-        Initialize Azure OpenAI provider.
-        
-        Args:
-            api_key: Azure API key
-            deployment: Deployment name
-            api_version: API version
-            base_url: Azure endpoint URL
-        """
-        self.api_key = api_key
-        self.deployment = deployment
-        self.api_version = api_version
-        self.base_url = base_url
+        config = ProviderConfig(
+            name="azure",
+            api_key=api_key,
+            model=deployment,  # Azure uses deployment name as model
+            base_url=base_url,
+            temperature=kwargs.get("temperature", 0.7),
+            max_tokens=kwargs.get("max_tokens", 1000),
+        )
+        super().__init__(config)
+        self._api_version = api_version
+        self._deployment = deployment
+        self._init_client()
+    
+    def _init_client(self):
+        """Initialize Azure OpenAI client."""
+        try:
+            import openai
+            self._client = openai.AzureOpenAI(
+                api_key=self.config.api_key,
+                api_version=self._api_version,
+                azure_endpoint=self.config.base_url,
+            )
+        except ImportError:
+            raise ImportError("Please install openai: pip install openai")
     
     def generate(self, messages: List[Dict[str, str]], **kwargs) -> str:
         """Generate response using Azure OpenAI API."""
         try:
-            import openai
-            client = openai.AzureOpenAI(
-                api_key=self.api_key,
-                api_version=self.api_version,
-                azure_endpoint=self.base_url,
-            )
-            
-            response = client.chat.completions.create(
-                deployment_id=self.deployment,
+            response = self._client.chat.completions.create(
+                deployment_id=self._deployment,
                 messages=messages,
-                temperature=kwargs.get("temperature", 0.7),
-                max_tokens=kwargs.get("max_tokens", 1000),
+                temperature=kwargs.get("temperature", self.config.temperature),
+                max_tokens=kwargs.get("max_tokens", self.config.max_tokens),
+            )
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            raise ProviderError(f"Azure API error: {e}")
+    
+    async def agenerate(self, messages: List[Dict[str, str]], **kwargs) -> str:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.generate(messages, **kwargs)
+        )
+    
+    async def astream_generate(self, messages: List[Dict[str, str]], **kwargs) -> AsyncGenerator[str, None]:
+        """Stream generate responses."""
+        try:
+            response = self._client.chat.completions.create(
+                deployment_id=self._deployment,
+                messages=messages,
+                temperature=kwargs.get("temperature", self.config.temperature),
+                max_tokens=kwargs.get("max_tokens", self.config.max_tokens),
+                stream=True,
             )
             
-            return response.choices[0].message.content or ""
-        except ImportError:
-            raise ImportError("Please install openai: pip install openai")
+            for chunk in response:
+                if chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
         except Exception as e:
-            raise ConnectionError(f"Azure API error: {e}")
+            raise ProviderError(f"Azure API error: {e}")
     
     def get_model_name(self) -> str:
-        return self.deployment
+        return self._deployment
     
     @property
     def provider_name(self) -> str:
         return "azure"
 
 
-class CustomProvider(BaseLLMProvider):
+class CustomProvider(OpenAICompatProvider):
     """
-    Custom OpenAI-compatible provider.
+    Custom OpenAI-compatible provider for local servers.
     
-    Allows users to connect to ANY service that implements the OpenAI Chat Completions API.
-    
-    Supports:
-    - Local models (Ollama, LM Studio, LocalAI, vLLM)
-    - Self-hosted servers
-    - Any OpenAI-compatible API service
-    
-    Example:
-        >>> from openthought import OpenThought
-        >>> provider = CustomProvider(
-        ...     api_key="ollama",
-        ...     base_url="http://localhost:11434/v1",
-        ...     model="llama3"
-        ... )
-        >>> ot = OpenThought(prompt="...", provider=provider)
+    Supports Ollama, LM Studio, LocalAI, vLLM, etc.
     """
     
     def __init__(
@@ -261,135 +470,44 @@ class CustomProvider(BaseLLMProvider):
         model: str = "llama3",
         **kwargs
     ):
-        """
-        Initialize custom provider.
-        
-        Args:
-            api_key: API key (can be any string, some local servers don't need it)
-            base_url: Base URL of the API server (must end with /v1)
-                     Examples:
-                     - http://localhost:11434/v1 (Ollama)
-                     - http://localhost:8000/v1 (vLLM)
-                     - http://localhost:1234/v1 (LM Studio)
-            model: Model name to use
-            **kwargs: Additional arguments (temperature, max_tokens, etc.)
-        """
-        self.api_key = api_key
-        self.base_url = base_url.rstrip('/') + '/v1'  # Ensure /v1 suffix
-        self.model = model
-        self.extra_kwargs = kwargs
-    
-    def generate(self, messages: List[Dict[str, str]], **kwargs) -> str:
-        """
-        Generate response using custom OpenAI-compatible API.
-        
-        Args:
-            messages: List of message dicts
-            **kwargs: Additional arguments (temperature, max_tokens, etc.)
-        
-        Returns:
-            Generated text response
-        """
-        try:
-            import openai
-            
-            # Merge extra kwargs with call kwargs
-            call_kwargs = {**self.extra_kwargs, **kwargs}
-            
-            client = openai.OpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-            )
-            
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=call_kwargs.get("temperature", 0.7),
-                max_tokens=call_kwargs.get("max_tokens", 1000),
-            )
-            
-            return response.choices[0].message.content or ""
-        
-        except ImportError:
-            raise ImportError("Please install openai: pip install openai")
-        except Exception as e:
-            raise ConnectionError(f"Custom API error: {e}\nCheck your base_url and model name.")
+        config = ProviderConfig(
+            name="custom",
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            temperature=kwargs.get("temperature", 0.7),
+            max_tokens=kwargs.get("max_tokens", 1000),
+            timeout=kwargs.get("timeout", 120),  # Longer timeout for local
+        )
+        super().__init__(config)
     
     def get_model_name(self) -> str:
-        return self.model
+        return self.config.model
+
+
+# Provider presets for common services
+PRESETS = {
+    # Cloud providers
+    "openai": {"class": OpenAIProvider, "default_model": "gpt-3.5-turbo"},
+    "kimi": {"class": KimiProvider, "default_model": "moonshot-v1-8k"},
+    "moonshot": {"class": KimiProvider, "default_model": "moonshot-v1-8k"},
+    "claude": {"class": ClaudeProvider, "default_model": None},  # Auto-select
+    "anthropic": {"class": ClaudeProvider, "default_model": None},
+    "azure": {"class": AzureProvider, "default_model": None},
     
-    @property
-    def provider_name(self) -> str:
-        return "custom"
+    # Chinese providers
+    "deepseek": {"class": DeepSeekProvider, "default_model": "deepseek-chat"},
+    "qwen": {"class": QwenProvider, "default_model": "qwen-turbo"},
+    "zhipu": {"class": ZhipuProvider, "default_model": "glm-4"},
+    "yi": {"class": OpenAIProvider, "default_model": "yi-34b-chat"},
+    "minimax": {"class": OpenAIProvider, "default_model": "abab6.5s-chat"},
     
-    def get_info(self) -> Dict[str, str]:
-        """Get provider information."""
-        return {
-            "provider": "custom",
-            "base_url": self.base_url,
-            "model": self.model,
-            "api_key": "***" if self.api_key and self.api_key != "not-needed" else "not-needed",
-        }
-
-
-# Provider registry
-PROVIDERS = {
-    "openai": OpenAIProvider,
-    "kimi": KimiProvider,
-    "moonshot": KimiProvider,
-    "claude": ClaudeProvider,
-    "anthropic": ClaudeProvider,
-    "azure": AzureProvider,
-    "custom": CustomProvider,
-    "ollama": CustomProvider,
-    "lmstudio": CustomProvider,
-    "localai": CustomProvider,
-    "vllm": CustomProvider,
-}
-
-
-# Common custom providers presets
-CUSTOM_PROVIDER_PRESETS = {
-    "ollama": {
-        "base_url": "http://localhost:11434/v1",
-        "model": "llama3",
-    },
-    "lmstudio": {
-        "base_url": "http://localhost:1234/v1",
-        "model": "llama-3-8b-instruct",
-    },
-    "localai": {
-        "base_url": "http://localhost:8080/v1",
-        "model": "llama-2-7b",
-    },
-    "vllm": {
-        "base_url": "http://localhost:8000/v1",
-        "model": "llama-2-7b",
-    },
-    "deepseek": {
-        "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-chat",
-    },
-    "qwen": {
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "model": "qwen-turbo",
-    },
-    "yi": {
-        "base_url": "https://api.lingyiwanwu.com/v1",
-        "model": "yi-34b-chat",
-    },
-    "moonshot-v1": {
-        "base_url": "https://api.moonshot.cn/v1",
-        "model": "moonshot-v1-8k",
-    },
-    "minimax": {
-        "base_url": "https://api.minimax.chat/v1/text/chatcompletion_v2",
-        "model": "abab6.5s-chat",
-    },
-    "zhipu": {
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "model": "glm-4",
-    },
+    # Local/Custom providers
+    "ollama": {"class": CustomProvider, "default_model": "llama3"},
+    "lmstudio": {"class": CustomProvider, "default_model": "llama-3-8b-instruct"},
+    "localai": {"class": CustomProvider, "default_model": "llama-2-7b"},
+    "vllm": {"class": CustomProvider, "default_model": "llama-2-7b"},
+    "custom": {"class": CustomProvider, "default_model": "custom-model"},
 }
 
 
@@ -404,184 +522,81 @@ def create_provider(
     Create an LLM provider instance.
     
     Args:
-        name: Provider name (openai, kimi, claude, azure, custom, ollama, etc.)
-        api_key: API key (optional for some custom providers)
+        name: Provider name
+        api_key: API key
         model: Optional model name override
         base_url: Optional base URL (required for custom providers)
-        **kwargs: Additional provider arguments
+        **kwargs: Additional arguments
     
     Returns:
         LLM provider instance
     
     Raises:
-        ValueError: If provider is not supported or missing required arguments
+        ValueError: If provider is not supported
+        ImportError: If required package not installed
     
     Examples:
-        >>> # Standard providers
         >>> create_provider("openai", "sk-xxx", model="gpt-4")
-        >>> create_provider("kimi", "your-kimi-key")
-        >>> create_provider("claude", "your-claude-key")
-        
-        >>> # Custom OpenAI-compatible provider (local Ollama)
         >>> create_provider("ollama", model="llama3")
-        >>> create_provider("custom", base_url="http://localhost:11434/v1", model="llama3")
-        
-        >>> # Chinese providers
-        >>> create_provider("qwen", "your-key", model="qwen-plus")
-        >>> create_provider("deepseek", "your-key", model="deepseek-chat")
-        >>> create_provider("zhipu", "your-key", model="glm-4")
+        >>> create_provider("claude", "sk-ant-xxx")  # Auto-select latest model
     """
     name = name.lower()
     
-    # Check if it's a preset for Chinese/local providers
-    if name in CUSTOM_PROVIDER_PRESETS:
-        preset = CUSTOM_PROVIDER_PRESETS[name]
-        return CustomProvider(
+    if name not in PRESETS:
+        # Check if it's a custom request
+        if base_url:
+            return CustomProvider(api_key=api_key or "not-needed", base_url=base_url, model=model or "custom-model", **kwargs)
+        
+        raise ValueError(
+            f"Unsupported provider: '{name}'. Supported providers: {', '.join(PRESETS.keys())}"
+        )
+    
+    preset = PRESETS[name]
+    provider_class = preset["class"]
+    
+    # Get default model
+    final_model = model or preset["default_model"]
+    
+    # Special handling for Azure (requires deployment name)
+    if name == "azure":
+        if not final_model:
+            raise ValueError("Azure provider requires a deployment name")
+        return provider_class(
             api_key=api_key or "",
-            base_url=preset["base_url"],
-            model=model or preset["model"],
+            deployment=final_model,
+            base_url=base_url,
             **kwargs
         )
     
-    if name not in PROVIDERS:
-        # Check if it's a valid custom provider request
-        if base_url:
-            return CustomProvider(
-                api_key=api_key or "not-needed",
-                base_url=base_url,
-                model=model or "custom-model",
-                **kwargs
-            )
-        
-        # Provide helpful error message with suggestions
-        suggestions = []
-        if name in ["ollama", "lmstudio", "localai", "vllm"]:
-            suggestions.append(f"Did you mean '{name}' preset? Use create_provider('{name}')")
-        elif name in ["deepseek", "qwen", "yi", "zhipu", "minimax"]:
-            suggestions.append(f"Try: create_provider('{name}', 'your-api_key')")
-        
-        raise ValueError(
-            f"Unsupported provider: '{name}'. "
-            f"Supported providers: openai, kimi, claude, azure, custom\n"
-            f"Chinese providers: qwen, deepseek, zhipu, yi, minimax\n"
-            f"Local servers: ollama, lmstudio, localai, vllm\n"
-            + ("\n".join(suggestions) if suggestions else "")
-        )
+    # Special handling for Claude (model is optional)
+    if name in ["claude", "anthropic"]:
+        return provider_class(api_key=api_key or "", model=model, **kwargs)
     
-    # Default models for each provider
-    default_models = {
-        "openai": "gpt-3.5-turbo",
-        "kimi": "moonshot-v1-8k",
-        "moonshot": "moonshot-v1-8k",
-        "claude": "claude-sonnet-4-20250514",
-        "anthropic": "claude-sonnet-4-20250514",
-        "azure": None,  # Must be specified
-        "custom": "custom-model",
-        "ollama": "llama3",
-        "lmstudio": "llama-3-8b-instruct",
-        "localai": "llama-2-7b",
-        "vllm": "llama-2-7b",
+    # Standard provider creation
+    return provider_class(
+        api_key=api_key or "",
+        model=final_model,
+        base_url=base_url,
+        **kwargs
+    )
+
+
+def get_provider_info(name: str) -> Dict[str, Any]:
+    """Get information about a provider."""
+    if name not in PRESETS:
+        raise ValueError(f"Unknown provider: {name}")
+    
+    preset = PRESETS[name]
+    return {
+        "name": name,
+        "class": preset["class"].__name__,
+        "default_model": preset["default_model"],
+        "is_cloud": name in ["openai", "kimi", "claude", "azure", "deepseek", "qwen", "zhipu", "yi", "minimax"],
+        "requires_api_key": name not in ["ollama", "lmstudio", "localai", "vllm", "custom"],
     }
-    
-    final_model = model or default_models.get(name, "gpt-3.5-turbo")
-    
-    # Special handling for Azure
-    if name == "azure" and not final_model:
-        raise ValueError("Azure provider requires a deployment name")
-    
-    # Build kwargs for providers
-    provider_kwargs = kwargs.copy()
-    if base_url:
-        provider_kwargs["base_url"] = base_url
-    
-    return PROVIDERS[name](api_key=api_key or "", model=final_model, **provider_kwargs)
 
 
-def get_available_providers() -> List[str]:
-    """Get list of available provider names."""
-    return list(PROVIDERS.keys())
-
-
-def auto_detect_provider(api_key: str) -> Optional[str]:
-    """
-    Attempt to auto-detect provider from API key format.
-    
-    Args:
-        api_key: The API key to analyze
-    
-    Returns:
-        Detected provider name or None
-    """
-    if not api_key:
-        return None
-    
-    # OpenAI keys typically start with sk-
-    if api_key.startswith("sk-") and "ant" not in api_key:
-        return "openai"
-    
-    # Anthropic keys typically start with sk-ant-api03-
-    if api_key.startswith("sk-ant-api"):
-        return "claude"
-    
-    # Kimi/API keys don't have a standard prefix
-    # Could add more heuristics here
-    
-    return None
-
-
-def list_all_providers() -> Dict[str, Dict[str, Any]]:
-    """
-    List all available providers with their information.
-    
-    Returns:
-        Dict of provider name -> provider info
-    """
-    info = {}
-    
-    # Standard providers
-    for name in ["openai", "kimi", "claude", "azure"]:
-        info[name] = {
-            "type": "cloud",
-            "requires_api_key": True,
-            "default_model": {
-                "openai": "gpt-3.5-turbo",
-                "kimi": "moonshot-v1-8k",
-                "claude": "claude-sonnet-4-20250514",
-                "azure": "your-deployment-name",
-            }.get(name),
-            "description": {
-                "openai": "OpenAI GPT models (GPT-3.5, GPT-4)",
-                "kimi": "Moonshot AI Kimi",
-                "claude": "Anthropic Claude",
-                "azure": "Microsoft Azure OpenAI",
-            }.get(name),
-        }
-    
-    # Custom/Local providers
-    for name, preset in CUSTOM_PROVIDER_PRESETS.items():
-        info[name] = {
-            "type": "custom",
-            "requires_api_key": False,
-            "default_model": preset["model"],
-            "base_url": preset["base_url"],
-            "description": {
-                "ollama": "Ollama local models (llama3, mistral, etc.)",
-                "lmstudio": "LM Studio local server",
-                "localai": "LocalAI",
-                "vllm": "vLLM inference server",
-                "deepseek": "DeepSeek Chat",
-                "qwen": "Alibaba Qwen (通义千问)",
-                "yi": "01.AI Yi (零一万物)",
-                "moonshot-v1": "Moonshot Kimi API",
-                "minimax": "MiniMax (海螺AI)",
-                "zhipu": "Zhipu AI (智谱清言)",
-            }.get(name),
-        }
-    
-    return info
-
-
-def test_provider_connection(
+async def test_provider_async(
     name: str,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -589,17 +604,10 @@ def test_provider_connection(
     test_message: str = "Hello"
 ) -> Dict[str, Any]:
     """
-    Test provider connection with a simple request.
-    
-    Args:
-        name: Provider name
-        api_key: API key
-        base_url: Base URL for custom providers
-        model: Model name
-        test_message: Test message to send
+    Test provider connection asynchronously.
     
     Returns:
-        Dict with success status and message/details
+        Dict with success status and details
     """
     try:
         provider = create_provider(
@@ -609,11 +617,8 @@ def test_provider_connection(
             model=model,
         )
         
-        messages = [
-            {"role": "user", "content": test_message}
-        ]
-        
-        response = provider.generate(messages, max_tokens=50)
+        messages = [{"role": "user", "content": test_message}]
+        response = await provider.agenerate(messages, max_tokens=50)
         
         return {
             "success": True,
@@ -621,7 +626,6 @@ def test_provider_connection(
             "model": provider.get_model_name(),
             "response_preview": response[:100] if response else "Empty response",
         }
-    
     except Exception as e:
         return {
             "success": False,
@@ -630,39 +634,42 @@ def test_provider_connection(
         }
 
 
+def list_providers() -> Dict[str, Dict[str, Any]]:
+    """List all available providers."""
+    return {name: get_provider_info(name) for name in PRESETS}
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("OpenThought Providers")
+    print("OpenThought Providers v3.0")
     print("=" * 60)
     
-    print("\n📦 Standard Cloud Providers:")
-    for name in ["openai", "kimi", "claude", "azure"]:
-        info = list_all_providers().get(name, {})
-        print(f"  • {name}: {info.get('description', 'N/A')}")
+    print("\n📦 Cloud Providers:")
+    for name in ["openai", "kimi", "claude", "azure", "deepseek", "qwen", "zhipu"]:
+        info = get_provider_info(name)
+        print(f"  • {name}: {info['default_model'] or 'dynamic'}")
     
-    print("\n🏠 Local/Custom Providers:")
+    print("\n🏠 Local Providers:")
     for name in ["ollama", "lmstudio", "localai", "vllm"]:
-        info = list_all_providers().get(name, {})
-        print(f"  • {name}: {info.get('description', 'N/A')}")
+        info = get_provider_info(name)
+        print(f"  • {name}: {info['default_model']}")
     
-    print("\n🇨🇳 Chinese Providers:")
-    for name in ["qwen", "deepseek", "zhipu", "yi", "minimax"]:
-        info = list_all_providers().get(name, {})
-        print(f"  • {name}: {info.get('description', 'N/A')}")
+    print("\n✨ New Features:")
+    print("  • Async/await support (agenerate)")
+    print("  • Streaming responses (astream_generate)")
+    print("  • Automatic retry on failures")
+    print("  • Unified provider interface")
     
-    print("\n" + "=" * 60)
-    print("Example usage:")
-    print("=" * 60)
+    print("\n💡 Usage:")
     print("""
-    # OpenAI
-    create_provider("openai", "sk-your-key", model="gpt-4")
+    # Sync
+    provider = create_provider("openai", "sk-xxx")
+    response = provider.generate(messages)
     
-    # Ollama (local)
-    create_provider("ollama", model="llama3")
+    # Async
+    response = await provider.agenerate(messages)
     
-    # Custom server
-    create_provider("custom", base_url="http://localhost:11434/v1", model="llama3")
-    
-    # Qwen
-    create_provider("qwen", "your-api-key")
+    # Streaming
+    async for chunk in provider.astream_generate(messages):
+        print(chunk, end="", flush=True)
     """)
